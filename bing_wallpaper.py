@@ -5,630 +5,655 @@ import getpass
 import ctypes
 import webbrowser
 import re
-from packaging import version
+import json
+
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except ImportError:
+    pass
+
+try:
+    from packaging import version
+    HAS_PACKAGING = True
+except ImportError:
+    HAS_PACKAGING = False
+
+import requests
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QPushButton, QLabel, QCheckBox, 
-                            QGroupBox, QFormLayout, QMessageBox, QSystemTrayIcon,
-                            QMenu, QAction)
-from PyQt5.QtCore import Qt, QTimer, QSettings, QSize
-from PyQt5.QtGui import QIcon, QPixmap, QImage
-import requests
-from requests.exceptions import RequestException
+                            QFrame, QMessageBox, QSystemTrayIcon,
+                            QMenu, QAction, QGraphicsDropShadowEffect, QStyle)
+from PyQt5.QtCore import Qt, QTimer, QSettings, QSize, QPoint, QThread, pyqtSignal, QObject
+from PyQt5.QtGui import QIcon, QPixmap, QImage, QColor, QFont, QPainter, QPainterPath
 
-class BingWallpaperManager(QMainWindow):
+# ==========================================
+# 0. 核心工具函数 - 修复图标路径问题
+# ==========================================
+def resource_path(relative_path):
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, relative_path)
+    
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, relative_path)
+
+# ==========================================
+# 1. 业务逻辑
+# ==========================================
+class WallpaperUtils:
+    @staticmethod
+    def get_bing_url():
+        url = "https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=zh-CN"
+        response = requests.get(url, verify=False, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        imgurl_base = data['images'][0]['urlbase']
+        return f"https://cn.bing.com{imgurl_base}_UHD.jpg"
+
+    @staticmethod
+    def download_image(url, save_path):
+        response = requests.get(url, verify=False, stream=True, timeout=30)
+        response.raise_for_status()
+        with open(save_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk: f.write(chunk)
+        return save_path
+
+    @staticmethod
+    def set_wallpaper_api(image_path):
+        abs_path = os.path.abspath(image_path)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError("壁纸文件未找到")
+        SPI_SETDESKWALLPAPER = 20
+        ctypes.windll.user32.SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, abs_path, 3)
+
+    @staticmethod
+    def clean_old_wallpapers(save_dir):
+        today = datetime.date.today()
+        count = 0
+        if not os.path.exists(save_dir): return 0
+        for filename in os.listdir(save_dir):
+            if filename.endswith("_UHD.jpg"):
+                try:
+                    date_str = filename.split("_")[0]
+                    file_date = datetime.datetime.strptime(date_str, "%Y%m%d").date()
+                    if file_date != today:
+                        os.remove(os.path.join(save_dir, filename))
+                        count += 1
+                except: pass
+        return count
+
+    @staticmethod
+    def check_update(current_ver):
+        if not HAS_PACKAGING:
+            return False, "库缺失", ""
+        api_url = "https://api.github.com/repos/QsSama-W/wallpaper-win/releases/latest"
+        response = requests.get(api_url, verify=True, timeout=5)
+        response.raise_for_status()
+        info = response.json()
+        latest_tag = re.sub(r'^v', '', info.get('tag_name', ''))
+        
+        if version.parse(latest_tag) > version.parse(current_ver):
+            return True, latest_tag, info.get('html_url')
+        return False, latest_tag, ""
+
+# ==========================================
+# 2. 线程 Worker
+# ==========================================
+class WorkerSignals(QObject):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+class Worker(QThread):
+    def __init__(self, task_func, *args, **kwargs):
+        super().__init__()
+        self.task_func = task_func
+        self.args = args
+        self.kwargs = kwargs
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            result = self.task_func(*self.args, **self.kwargs)
+            self.signals.finished.emit(result)
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+# ==========================================
+# 3. UI 组件
+# ==========================================
+class ModernButton(QPushButton):
+    def __init__(self, text, color="#007AFF", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(42)
+        self.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
+        self.update_style(color)
+
+    def update_style(self, color):
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {color};
+                color: white;
+                border-radius: 21px;
+                border: none;
+                padding: 0 20px;
+            }}
+            QPushButton:hover {{ background-color: {self.adjust_color(color, 20)}; }}
+            QPushButton:pressed {{ background-color: {self.adjust_color(color, -20)}; }}
+            QPushButton:disabled {{ background-color: #cccccc; }}
+        """)
+
+    def adjust_color(self, hex_color, factor):
+        c = QColor(hex_color)
+        r = max(0, min(255, c.red() + factor))
+        g = max(0, min(255, c.green() + factor))
+        b = max(0, min(255, c.blue() + factor))
+        return f"rgb({r}, {g}, {b})"
+
+class ModernCheckBox(QCheckBox):
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self.setFont(QFont("Microsoft YaHei", 10))
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet("""
+            QCheckBox { color: #555; spacing: 8px; }
+            QCheckBox::indicator {
+                width: 20px; height: 20px;
+                border-radius: 6px;
+                border: 2px solid #ddd;
+                background: rgba(255,255,255,0.8);
+            }
+            QCheckBox::indicator:unchecked:hover { border-color: #007AFF; }
+            QCheckBox::indicator:checked {
+                background-color: #007AFF; border-color: #007AFF;
+            }
+        """)
+
+# ==========================================
+# 4. 主程序
+# ==========================================
+class BingWallpaperApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        # [修改] 更新版本号
-        self.current_version = "1.2.0"
+        self.current_version = "1.4.0" 
         self.username = getpass.getuser()
         self.save_dir = os.path.join(f"C:\\Users\\{self.username}", "Pictures", "bing_wallpaper")
+        
+        self.images_dir = resource_path("images")
+        
         self.settings = QSettings("BingWallpaper", "Manager")
         
-        self.target_width = 650
-        self.target_height = 675
+        self.preview_worker = None
+        self.download_worker = None
+        self.update_worker = None
+        self.is_download_running = False
+        self.is_preview_running = False
         
-        # 禁用最小化和最大化按钮
-        self.setWindowFlags(
-            Qt.WindowTitleHint |
-            Qt.WindowCloseButtonHint
-        )
+        self.shadow_margin = 25
+        self.content_width = 680
+        self.content_height = 780 
+        self.resize(self.content_width + 2*self.shadow_margin, self.content_height + 2*self.shadow_margin)
         
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowSystemMenuHint | Qt.WindowMinimizeButtonHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        
+        logo_path = os.path.join(self.images_dir, "logo.png")
+        if os.path.exists(logo_path):
+            self.setWindowIcon(QIcon(logo_path))
+
+        self.m_flag = False
+        self.m_Position = QPoint()
+
         if not self.check_screen_resolution():
-            QApplication.quit()
+            QTimer.singleShot(0, QApplication.quit)
             return
-        
-        self.check_windows_version()
-        self.init_ui()
-        self.init_tray()
+
+        self.setup_ui()
+        self.setup_tray()
         self.load_settings()
+        
         os.makedirs(self.save_dir, exist_ok=True)
         
-        if self.auto_start_checkbox.isChecked():
+        if self.auto_start_chk.isChecked():
             self.set_startup_registry(True)
-        
+            
         self.hide()
         self.tray_icon.show()
         
-        # 启动后延迟执行自动下载
-        QTimer.singleShot(3000, self.auto_download_and_set_wallpaper)
-        if self.auto_check_update_checkbox.isChecked():
-            QTimer.singleShot(5000, self.check_for_updates)
+        QTimer.singleShot(500, self.start_refresh_preview)
+        QTimer.singleShot(2000, self.start_auto_download)
+        
+        if self.auto_update_chk.isChecked():
+            QTimer.singleShot(5000, self.start_check_update)
 
-    def check_screen_resolution(self):
-        """检查屏幕分辨率是否不低于1920*1080"""
-        screen = QApplication.primaryScreen()
-        if not screen:
-            QMessageBox.critical(None, "错误", "无法检测屏幕信息")
-            return False
-            
-        geometry = screen.geometry()
-        width = geometry.width()
-        height = geometry.height()
+    def setup_ui(self):
+        base_widget = QWidget()
+        self.setCentralWidget(base_widget)
+        main_layout = QVBoxLayout(base_widget)
+        main_layout.setContentsMargins(self.shadow_margin, self.shadow_margin, self.shadow_margin, self.shadow_margin)
         
-        if width < 1920 or height < 1080:
-            QMessageBox.critical(
-                None, 
-                "分辨率不足", 
-                f"检测到当前屏幕分辨率为 {width}x{height}\n"
-                "本程序需要最低1920x1080的屏幕分辨率才能正常运行。\n"
-                "请调整分辨率后重新启动程序。"
-            )
-            return False
-        return True
+        self.container = QFrame()
+        self.container.setObjectName("Container")
+        self.container.setStyleSheet("""
+            #Container {
+                background-color: rgba(255, 255, 255, 245); 
+                border-radius: 24px;
+                border: 1px solid rgba(255, 255, 255, 180);
+            }
+        """)
+        
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(30)
+        shadow.setColor(QColor(0, 0, 0, 40))
+        shadow.setYOffset(10)
+        self.container.setGraphicsEffect(shadow)
+        main_layout.addWidget(self.container)
+        
+        self.content_layout = QVBoxLayout(self.container)
+        self.content_layout.setContentsMargins(30, 25, 30, 30)
+        self.content_layout.setSpacing(20)
+        
+        self.setup_header()
+        self.setup_preview_area()
+        self.setup_action_buttons()
+        self.setup_settings_area()
+        self.setup_footer()
 
-    def check_windows_version(self):
-        """检查Windows版本是否高于Win10 22H2"""
-        required_major = 10
-        required_minor = 0
-        required_build = 19045
+    def setup_header(self):
+        header = QHBoxLayout()
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
         
-        try:
-            version = sys.getwindowsversion()
-            major = version.major
-            minor = version.minor
-            build = version.build
-            
-            if (major < required_major or 
-                (major == required_major and minor < required_minor) or 
-                (major == required_major and minor == required_minor and build < required_build)):
-                
-                QMessageBox.warning(
-                    self, 
-                    "兼容性警告", 
-                    "您的Windows版本低于Win10 22H2，程序可能存在兼容性问题。\n"
-                    "建议升级到最新版本的Windows以获得最佳体验。"
-                )
-        except Exception as e:
-            QMessageBox.information(
-                self, 
-                "版本检测", 
-                f"无法检测Windows版本: {str(e)}\n程序将继续运行。"
-            )
+        title = QLabel("Bing Wallpaper")
+        title.setFont(QFont("Microsoft YaHei", 20, QFont.Bold))
+        title.setStyleSheet("color: #1c1c1e;")
+        
+        sub_title = QLabel("每日高清壁纸自动同步")
+        sub_title.setFont(QFont("Microsoft YaHei", 10))
+        sub_title.setStyleSheet("color: #8E8E93;")
+        
+        titles.addWidget(title)
+        titles.addWidget(sub_title)
+        
+        close_btn = QPushButton("×")
+        close_btn.setFixedSize(32, 32)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(0,0,0,0.05); color: #888; border-radius: 16px;
+                font-family: Arial; font-size: 22px; border: none; padding-bottom: 2px;
+            }
+            QPushButton:hover { background: #FF3B30; color: white; }
+        """)
+        close_btn.clicked.connect(self.close)
+        
+        header.addLayout(titles)
+        header.addStretch()
+        header.addWidget(close_btn, 0, Qt.AlignTop)
+        self.content_layout.addLayout(header)
 
-    def init_ui(self):
-        """初始化用户界面"""
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        self.images_dir = os.path.join(base_dir, "images")
-        os.makedirs(self.images_dir, exist_ok=True)
+    def setup_preview_area(self):
+        self.preview_container = QFrame()
         
-        try:
-            pixmap2 = QPixmap(os.path.join(self.images_dir, "logo.png"))
-            icon = QIcon(pixmap2)
-            self.setWindowIcon(icon)
-        except:
-            pass
-
-        self.setWindowTitle(f"Bing壁纸v{self.current_version}")
-        self.resize(self.target_width, self.target_height)
+        self.preview_container.setFixedSize(620, 349)
+        self.preview_container.setStyleSheet("background: rgba(0,0,0,0.04); border-radius: 16px;")
         
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(15)
+        p_layout = QVBoxLayout(self.preview_container)
+        p_layout.setContentsMargins(0,0,0,0)
         
-        top_layout = QHBoxLayout()
-        title_label = QLabel("自动设置今日Bing壁纸为桌面壁纸")
-        title_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #2c3e50;")
-        title_label.setAlignment(Qt.AlignCenter)
-        top_layout.addStretch()
-        top_layout.addWidget(title_label)
-        top_layout.addStretch()
-        main_layout.addLayout(top_layout)
-        
-        preview_group = QGroupBox("今日壁纸预览")
-        preview_layout = QVBoxLayout()
-        self.preview_label = QLabel()
+        self.preview_label = QLabel("等待获取...")
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumHeight(200)
-        self.preview_label.setStyleSheet("border: 1px solid #ddd; border-radius: 4px;")
-        preview_layout.addWidget(self.preview_label)
-        preview_group.setLayout(preview_layout)
-        main_layout.addWidget(preview_group)
+        self.preview_label.setStyleSheet("color: #aeaeb2; border-radius: 16px;")
         
-        button_layout = QHBoxLayout()
-        self.download_btn = QPushButton("下载并设置壁纸")
-        self.download_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db;
-                color: white;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background-color: #2980b9;
-            }
-        """)
-        self.download_btn.clicked.connect(self.download_and_set_wallpaper)
+        p_layout.addWidget(self.preview_label)
+        self.content_layout.addWidget(self.preview_container)
+
+    def setup_action_buttons(self):
+        layout = QHBoxLayout()
+        layout.setSpacing(15)
         
-        self.refresh_btn = QPushButton("刷新预览")
-        self.refresh_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2ecc71;
-                color: white;
-                border-radius: 4px;
-                padding: 8px 16px;
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background-color: #27ae60;
-            }
-        """)
-        self.refresh_btn.clicked.connect(self.refresh_preview)
+        self.btn_apply = ModernButton("下载并应用今日壁纸", "#007AFF")
+        self.btn_apply.clicked.connect(self.start_manual_download)
         
-        button_layout.addWidget(self.download_btn)
-        button_layout.addWidget(self.refresh_btn)
-        main_layout.addLayout(button_layout)
+        self.btn_refresh = ModernButton("刷新预览", "#34C759")
+        self.btn_refresh.clicked.connect(self.start_refresh_preview)
         
-        settings_group = QGroupBox("设置")
-        settings_layout = QFormLayout()
+        layout.addWidget(self.btn_apply)
+        layout.addWidget(self.btn_refresh)
+        self.content_layout.addLayout(layout)
+
+    def setup_settings_area(self):
+        frame = QFrame()
+        frame.setStyleSheet("background: rgba(255,255,255,0.6); border-radius: 16px;")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(20, 15, 20, 15)
+        layout.setSpacing(12)
         
-        self.auto_delete_checkbox = QCheckBox("开启自动删除历史壁纸")
-        self.auto_delete_checkbox.stateChanged.connect(self.save_settings)
+        self.auto_del_chk = ModernCheckBox("自动清理历史壁纸")
+        self.auto_start_chk = ModernCheckBox("开机自动启动")
+        self.auto_update_chk = ModernCheckBox("自动检查软件更新")
+        self.silent_exit_chk = ModernCheckBox("壁纸无更新时不弹出通知") 
         
-        self.auto_start_checkbox = QCheckBox("开机自动启动")
-        self.auto_start_checkbox.stateChanged.connect(self.on_auto_start_changed)
+        self.auto_del_chk.stateChanged.connect(self.save_settings)
+        self.auto_start_chk.stateChanged.connect(self.on_autostart_change)
+        self.auto_update_chk.stateChanged.connect(self.save_settings)
+        self.silent_exit_chk.stateChanged.connect(self.save_settings)
         
-        self.auto_check_update_checkbox = QCheckBox("开启自动检查更新")
-        self.auto_check_update_checkbox.stateChanged.connect(self.save_settings)
-        
-        settings_layout.addRow(self.auto_delete_checkbox)
-        settings_layout.addRow(self.auto_start_checkbox)
-        settings_layout.addRow(self.auto_check_update_checkbox)
-        settings_group.setLayout(settings_layout)
-        main_layout.addWidget(settings_group)
-        
-        bottom_layout = QHBoxLayout()
+        layout.addWidget(self.auto_del_chk)
+        layout.addWidget(self.auto_start_chk)
+        layout.addWidget(self.auto_update_chk)
+        layout.addWidget(self.silent_exit_chk)
+        self.content_layout.addWidget(frame)
+
+    def setup_footer(self):
+        layout = QHBoxLayout()
         self.status_label = QLabel("就绪")
-        bottom_layout.addWidget(self.status_label)
-        bottom_layout.addStretch()
+        self.status_label.setStyleSheet("color: #999; font-size: 12px;")
         
-        self.home_btn = QPushButton()
-        self.home_btn.setFixedSize(27, 27)
-        self.home_btn.setStyleSheet("""
-            QPushButton {
-                border-radius: 6px;
-                background-color: white;
-                border: 1px solid #ddd;
-                padding: 2px;
-            }
-            QPushButton:hover {
-                background-color: #f0f0f0;
-                border-color: #bbb;
-            }
-            QPushButton:pressed {
-                background-color: #e0e0e0;
-            }
-        """)
+        self.btn_update_chk = QPushButton("检查更新")
+        self.btn_update_chk.setCursor(Qt.PointingHandCursor)
+        self.btn_update_chk.setStyleSheet("border:none; color:#007AFF; font-weight:bold;")
+        self.btn_update_chk.clicked.connect(self.start_check_update)
         
-        home_icon = QIcon(os.path.join(self.images_dir, "home.png"))
-        self.home_btn.setIcon(home_icon)
-        self.home_btn.setIconSize(QSize(23, 23))
-        self.home_btn.clicked.connect(lambda: webbrowser.open("https://ombk.xyz"))
+        icon_style = "border:none; padding:4px; border-radius:4px;"
         
-        self.github_btn = QPushButton()
-        self.github_btn.setFixedSize(27, 27)
-        self.github_btn.setStyleSheet("""
-            QPushButton {
-                border-radius: 6px;
-                background-color: white;
-                border: 1px solid #ddd;
-                padding: 2px;
-            }
-            QPushButton:hover {
-                background-color: #f0f0f0;
-                border-color: #bbb;
-            }
-            QPushButton:pressed {
-                background-color: #e0e0e0;
-            }
-        """)
+        btn_home = QPushButton("") 
+        btn_home.setFixedSize(28,28)
+        btn_home.setStyleSheet(icon_style)
+        btn_home.clicked.connect(lambda: webbrowser.open("https://ombk.xyz"))
         
-        github_icon = QIcon(os.path.join(self.images_dir, "github.png"))
-        self.github_btn.setIcon(github_icon)
-        self.github_btn.setIconSize(QSize(25, 25))
-        self.github_btn.clicked.connect(lambda: webbrowser.open("https://github.com/QsSama-W/wallpaper-win"))
+        home_icon_path = os.path.join(self.images_dir, "home.png")
+        if os.path.exists(home_icon_path):
+            btn_home.setIcon(QIcon(home_icon_path))
         
-        self.check_update_btn = QPushButton("检查更新")
-        self.check_update_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #f39c12;
-                color: white;
-                border-radius: 4px;
-                padding: 6px 12px;
-                font-size: 13px;
-            }
-            QPushButton:hover {
-                background-color: #d35400;
-            }
-        """)
-        self.check_update_btn.clicked.connect(self.check_for_updates)
+        btn_git = QPushButton("") 
+        btn_git.setFixedSize(28,28)
+        btn_git.setStyleSheet(icon_style)
+        btn_git.clicked.connect(lambda: webbrowser.open("https://github.com/QsSama-W/wallpaper-win"))
         
-        bottom_layout.addWidget(self.home_btn)
-        bottom_layout.addWidget(self.github_btn)
-        bottom_layout.addWidget(self.check_update_btn)
-        
-        main_layout.addLayout(bottom_layout)
-        QTimer.singleShot(1000, self.refresh_preview)
+        git_icon_path = os.path.join(self.images_dir, "github.png")
+        if os.path.exists(git_icon_path):
+            btn_git.setIcon(QIcon(git_icon_path))
 
-    def resizeEvent(self, event):
-        """窗口大小改变事件处理"""
-        super().resizeEvent(event)
-        current_width = self.width()
-        current_height = self.height()
-        
-        if current_width != self.target_width or current_height != self.target_height:
-            QTimer.singleShot(100, self.resetSize)
-            
-    def resetSize(self):
-        """重置窗口到目标尺寸"""
-        self.resize(self.target_width, self.target_height)
+        layout.addWidget(self.status_label)
+        layout.addStretch()
+        layout.addWidget(self.btn_update_chk)
+        layout.addWidget(btn_home)
+        layout.addWidget(btn_git)
+        self.content_layout.addLayout(layout)
 
-    def init_tray(self):
-        """初始化系统托盘"""
-        self.tray_icon = QSystemTrayIcon(self)
-        icon_path = os.path.join(self.images_dir, "logo.png")
-        icon = QIcon(QPixmap(icon_path))
-        self.tray_icon.setIcon(icon)
-        self.tray_icon.setToolTip("Bing壁纸")
-        
-        tray_menu = QMenu(self)
-        show_action = QAction("显示窗口", self)
-        show_action.triggered.connect(self.show)
-        tray_menu.addAction(show_action)
-        
-        update_action = QAction("更新壁纸", self)
-        update_action.triggered.connect(self.download_and_set_wallpaper)
-        tray_menu.addAction(update_action)
-        
-        check_update_action = QAction("检查更新", self)
-        check_update_action.triggered.connect(self.check_for_updates)
-        tray_menu.addAction(check_update_action)
-        
-        exit_action = QAction("退出", self)
-        exit_action.triggered.connect(self.on_exit)
-        tray_menu.addAction(exit_action)
-        
-        self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.activated.connect(self.on_tray_activated)
+    def set_ui_busy(self, busy, msg=""):
+        self.is_download_running = busy
+        self.btn_apply.setEnabled(not busy)
+        self.btn_apply.setText(msg if busy else "下载并应用今日壁纸")
+        if busy:
+            self.status_label.setText(msg + "...")
+        else:
+            self.status_label.setText("就绪")
 
-    def on_tray_activated(self, reason):
-        """托盘图标激活事件处理"""
-        if reason == QSystemTrayIcon.DoubleClick:
-            self.show()
+    def start_refresh_preview(self):
+        if self.is_preview_running: return 
+        self.is_preview_running = True
+        self.btn_refresh.setEnabled(False)
+        self.btn_refresh.setText("刷新中...")
+        self.preview_worker = Worker(self.task_refresh_preview)
+        self.preview_worker.signals.finished.connect(self.on_preview_ready)
+        self.preview_worker.signals.error.connect(self.on_preview_error)
+        self.preview_worker.start()
 
-    def load_settings(self):
-        """加载保存的设置"""
-        auto_delete = self.settings.value("auto_delete", False, type=bool)
-        auto_start = self.settings.value("auto_start", False, type=bool)
-        auto_check_update = self.settings.value("auto_check_update", True, type=bool)
-        
-        self.auto_delete_checkbox.setChecked(auto_delete)
-        self.auto_start_checkbox.setChecked(auto_start)
-        self.auto_check_update_checkbox.setChecked(auto_check_update)
+    def task_refresh_preview(self):
+        url = WallpaperUtils.get_bing_url()
+        preview_url = url.replace("_UHD.jpg", "_1366x768.jpg")
+        resp = requests.get(preview_url, verify=False, timeout=10)
+        resp.raise_for_status()
+        return resp.content
 
-    def save_settings(self):
-        """保存设置"""
-        self.settings.setValue("auto_delete", self.auto_delete_checkbox.isChecked())
-        self.settings.setValue("auto_check_update", self.auto_check_update_checkbox.isChecked())
-        self.settings.sync()
-
-    def on_auto_start_changed(self):
-        """处理开机启动设置变化"""
-        self.settings.setValue("auto_start", self.auto_start_checkbox.isChecked())
-        self.settings.sync()
-        self.set_startup_registry(self.auto_start_checkbox.isChecked())
-
-    def set_startup_registry(self, enable):
-        """设置开机启动注册表项"""
+    def on_preview_ready(self, img_data):
+        self.is_preview_running = False
+        self.btn_refresh.setEnabled(True)
+        self.btn_refresh.setText("刷新预览")
         try:
-            import winreg as reg
-            app_path = sys.argv[0]
-            key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-            
-            with reg.OpenKey(reg.HKEY_CURRENT_USER, key_path, 0, reg.KEY_SET_VALUE) as key:
-                if enable:
-                    reg.SetValueEx(key, "BingWallpaperManager", 0, reg.REG_SZ, app_path)
-                else:
-                    try:
-                        reg.DeleteValue(key, "BingWallpaperManager")
-                    except FileNotFoundError:
-                        pass
-            return True
-        except Exception as e:
-            QMessageBox.warning(self, "错误", f"设置开机启动失败: {str(e)}")
-            return False
-
-    def get_bing_wallpaper_url(self):
-        """获取Bing壁纸URL"""
-        try:
-            url = "https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=zh-CN"
-            response = requests.get(url, verify=False)
-            response.raise_for_status()
-            data = response.json()
-            imgurl_base = data['images'][0]['urlbase']
-            return f"https://cn.bing.com{imgurl_base}_UHD.jpg"
-        except (RequestException, KeyError, IndexError) as e:
-            self.status_label.setText(f"获取壁纸URL失败: {str(e)}")
-            return None
-
-    def refresh_preview(self):
-        """刷新预览图"""
-        self.status_label.setText("正在加载预览图...")
-        url = self.get_bing_wallpaper_url()
-        if not url:
-            return
-            
-        try:
-            preview_url = url.replace("_UHD.jpg", "_1366x768.jpg")
-            response = requests.get(preview_url, verify=False, stream=True)
-            response.raise_for_status()
-            
             image = QImage()
-            image.loadFromData(response.content)
+            image.loadFromData(img_data)
             pixmap = QPixmap.fromImage(image)
             
-            scaled_pixmap = pixmap.scaled(
-                self.preview_label.width(), 
-                self.preview_label.height(), 
-                Qt.KeepAspectRatio, 
-                Qt.SmoothTransformation
-            )
+            container_w = self.preview_container.width()
+            container_h = self.preview_container.height()
             
-            self.preview_label.setPixmap(scaled_pixmap)
-            self.status_label.setText("预览图加载完成")
+            scaled_pix = pixmap.scaled(container_w, container_h, 
+                                     Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            
+            rounded = QPixmap(scaled_pix.size())
+            rounded.fill(Qt.transparent)
+            
+            painter = QPainter(rounded)
+            painter.setRenderHint(QPainter.Antialiasing)
+            path = QPainterPath()
+            path.addRoundedRect(0, 0, scaled_pix.width(), scaled_pix.height(), 16, 16)
+            painter.setClipPath(path)
+            painter.drawPixmap(0, 0, scaled_pix)
+            painter.end()
+            
+            self.preview_label.setPixmap(rounded)
+            
+            if not self.is_download_running:
+                self.status_label.setText("预览已更新")
         except Exception as e:
-            self.status_label.setText(f"预览图加载失败: {str(e)}")
+            self.on_preview_error(str(e))
+            
+    def on_preview_error(self, err_msg):
+        self.is_preview_running = False
+        self.btn_refresh.setEnabled(True)
+        self.btn_refresh.setText("刷新预览")
+        self.preview_label.setText("获取预览失败")
 
-    def delete_old_wallpapers(self):
-        """删除旧壁纸"""
-        try:
-            today = datetime.date.today()
-            for filename in os.listdir(self.save_dir):
-                if filename.endswith("_UHD.jpg"):
-                    try:
-                        date_str = filename.split("_")[0]
-                        file_date = datetime.datetime.strptime(date_str, "%Y%m%d").date()
-                        
-                        if file_date != today:
-                            file_path = os.path.join(self.save_dir, filename)
-                            os.remove(file_path)
-                            print(f"已删除历史壁纸: {filename}")
-                    except (ValueError, OSError) as e:
-                        print(f"删除文件 {filename} 失败: {str(e)}")
-        except Exception as e:
-            print(f"自动删除历史壁纸出错: {str(e)}")
+    def start_manual_download(self):
+        if self.is_download_running: return
+        self.set_ui_busy(True, "正在下载")
+        self.download_worker = Worker(self.task_download_set, auto_exit=False)
+        self.download_worker.signals.finished.connect(self.on_download_success)
+        self.download_worker.signals.error.connect(self.on_worker_error)
+        self.download_worker.start()
 
-    def schedule_auto_exit(self):
-        """[新增] 安排程序在1分钟后自动退出"""
-        self.status_label.setText("壁纸更新成功，程序将在1分钟后自动退出")
-        QTimer.singleShot(60000, self.on_exit)
-        self.tray_icon.showMessage(
-            "提示", 
-            "壁纸更新成功，程序将在1分钟后自动退出",
-            QSystemTrayIcon.Information,
-            1000
-        )
-
-    def auto_download_and_set_wallpaper(self):
-        """自动下载并设置壁纸，不显示弹窗"""
-        self.status_label.setText("程序启动，自动获取今日壁纸...")
+    def start_auto_download(self):
+        if self.is_download_running: return 
         
-        wallpaper_url = self.get_bing_wallpaper_url()
-        if not wallpaper_url:
-            return
-            
+        self.is_download_running = True
+        self.status_label.setText("自动运行中...")
+        self.download_worker = Worker(self.task_download_set, auto_exit=True)
+        self.download_worker.signals.finished.connect(self.on_download_success)
+        self.download_worker.signals.error.connect(self.on_auto_error)
+        self.download_worker.start()
+
+    def task_download_set(self, auto_exit=False):
+        url = WallpaperUtils.get_bing_url()
         today = datetime.date.today().strftime("%Y%m%d")
         filename = f"{today}_UHD.jpg"
         save_path = os.path.join(self.save_dir, filename)
         
-        try:
-            if os.path.exists(save_path):
-                self.status_label.setText("今日壁纸已存在，无需重复下载")
-                if self.set_wallpaper(save_path):
-                    self.status_label.setText("已使用现有壁纸更新桌面")
-                    self.schedule_auto_exit()
-                return
+        is_new = False
+        if not os.path.exists(save_path):
+            WallpaperUtils.download_image(url, save_path)
+            is_new = True
             
-            self.status_label.setText("正在下载今日壁纸...")
-            response = requests.get(wallpaper_url, verify=False, stream=True)
-            response.raise_for_status()
+        WallpaperUtils.set_wallpaper_api(save_path)
+        
+        cleaned = 0
+        if self.auto_del_chk.isChecked():
+            cleaned = WallpaperUtils.clean_old_wallpapers(self.save_dir)
             
-            with open(save_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=1024):
-                    if chunk:
-                        f.write(chunk)
-            
-            self.status_label.setText("壁纸下载完成")
-            
-            if self.auto_delete_checkbox.isChecked():
-                self.delete_old_wallpapers()
-            
-            if self.set_wallpaper(save_path):
-                self.status_label.setText("壁纸已自动设置为桌面背景")
-                self.refresh_preview()
-                self.tray_icon.showMessage(
-                    "成功", 
-                    "Bing每日壁纸已更新",
-                    QSystemTrayIcon.Information,
-                    3000
-                )
-                # [新增] 成功设置后触发自动退出
-                self.schedule_auto_exit()
-            else:
-                self.status_label.setText("自动设置壁纸失败")
-                
-        except Exception as e:
-            error_msg = f"自动更新失败: {str(e)}"
-            self.status_label.setText(error_msg)
-            self.tray_icon.showMessage(
-                "错误", 
-                error_msg,
-                QSystemTrayIcon.Critical,
-                3000
-            )
+        return {"path": save_path, "cleaned": cleaned, "auto": auto_exit, "is_new": is_new}
 
-    def closeEvent(self, event):
-        """重写关闭事件，将窗口隐藏到托盘而不是退出程序"""
+    def on_download_success(self, result):
+        self.set_ui_busy(False)
+        self.status_label.setText("壁纸设置成功")
+        if result['auto']:
+            self.schedule_exit(is_new=result.get('is_new', True))
+        else:
+            QMessageBox.information(self, "成功", "今日壁纸已应用到桌面！")
+
+    def on_worker_error(self, err_msg):
+        self.set_ui_busy(False)
+        self.status_label.setText("错误")
+        if self.isVisible():
+            QMessageBox.warning(self, "操作失败", str(err_msg))
+            
+    def on_auto_error(self, err_msg):
+        self.is_download_running = False
+        self.status_label.setText(f"自动任务失败: {err_msg}")
+
+    def schedule_exit(self, is_new=True):
+        self.is_download_running = False
+        if is_new:
+            self.status_label.setText("任务完成，1分钟后自动退出")
+            self.tray_icon.showMessage("每日必应壁纸", "Bing壁纸已更新，程序即将退出", QSystemTrayIcon.Information, 2000)
+        else:
+            if self.silent_exit_chk.isChecked():
+                self.status_label.setText("壁纸已是最新，静默等待自动退出")
+            else:
+                self.status_label.setText("壁纸已是最新，1分钟后自动退出")
+                self.tray_icon.showMessage("每日必应壁纸", "今日壁纸已是最新，程序即将退出", QSystemTrayIcon.Information, 2000)
+                
+        QTimer.singleShot(60000, self.on_exit)
+
+    def start_check_update(self):
+        if not HAS_PACKAGING:
+            self.status_label.setText("无法检查更新(缺失库)")
+            return
+            
+        self.status_label.setText("检查更新...")
+        self.update_worker = Worker(WallpaperUtils.check_update, self.current_version)
+        self.update_worker.signals.finished.connect(self.on_update_checked)
+        self.update_worker.start()
+
+    def on_update_checked(self, result):
+        has_update, ver, url = result
+        if has_update:
+            if self.isVisible():
+                btn = QMessageBox.question(self, "发现新版本", f"版本 {ver} 可用，是否去下载？")
+                if btn == QMessageBox.Yes:
+                    webbrowser.open(url)
+            else:
+                self.tray_icon.showMessage("每日必应壁纸", f"发现新版本 {ver} 已发布，点击查看", QSystemTrayIcon.Information, 5000)
+            self.status_label.setText(f"发现新版本: {ver}")
+        else:
+            self.status_label.setText("当前是最新版本")
+
+    def check_screen_resolution(self):
+        geo = QApplication.primaryScreen().geometry()
+        return not (geo.width() < 1280 or geo.height() < 720)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and event.y() < 80:
+            self.m_flag = True
+            self.m_Position = event.globalPos() - self.pos()
+            event.accept()
+            
+    def mouseMoveEvent(self, event):
+        if self.m_flag:
+            self.move(event.globalPos() - self.m_Position)
+            event.accept()
+            
+    def mouseReleaseEvent(self, event):
+        self.m_flag = False
+
+    def setup_tray(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        
+        logo_path = os.path.join(self.images_dir, "logo.png")
+        if os.path.exists(logo_path):
+            self.tray_icon.setIcon(QIcon(logo_path))
+        else:
+            self.tray_icon.setIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
+        
+        menu = QMenu()
+        menu.setStyleSheet("QMenu{background:#fff; border:1px solid #eee;} QMenu::item{padding:5px 20px; color:#333;}")
+        
+        menu.addAction("显示主界面", self.showNormal)
+        menu.addAction("立即更新壁纸", self.start_manual_download)
+        menu.addSeparator()
+        menu.addAction("退出", self.on_exit)
+        
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(lambda r: self.showNormal() if r == QSystemTrayIcon.DoubleClick or r == QSystemTrayIcon.Trigger else None)
+        self.tray_icon.show()
+
+    def closeEvent(self, e):
         if self.tray_icon.isVisible():
             self.hide()
-            self.tray_icon.showMessage(
-                "提示",
-                "程序已最小化到系统托盘",
-                QSystemTrayIcon.Information,
-                1000
-            )
-            event.ignore()
-        else:
-            event.accept()
+            self.tray_icon.showMessage("每日必应壁纸", "程序已最小化到托盘", QSystemTrayIcon.Information, 1000)
+            e.ignore()
+        else: e.accept()
+        
+    def _get_bool_setting(self, key, default=False):
+        val = self.settings.value(key, default)
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str):
+            return val.lower() == 'true'
+        return bool(val)
+
+    def load_settings(self):
+        self.auto_del_chk.blockSignals(True)
+        self.auto_start_chk.blockSignals(True)
+        self.auto_update_chk.blockSignals(True)
+        self.silent_exit_chk.blockSignals(True)
+
+        self.auto_del_chk.setChecked(self._get_bool_setting("auto_delete", False))
+        self.auto_start_chk.setChecked(self._get_bool_setting("auto_start", False))
+        self.auto_update_chk.setChecked(self._get_bool_setting("auto_check_update", True))
+        self.silent_exit_chk.setChecked(self._get_bool_setting("silent_exit", False))
+        
+        self.auto_del_chk.blockSignals(False)
+        self.auto_start_chk.blockSignals(False)
+        self.auto_update_chk.blockSignals(False)
+        self.silent_exit_chk.blockSignals(False)
+
+    def save_settings(self):
+        self.settings.setValue("auto_delete", self.auto_del_chk.isChecked())
+        self.settings.setValue("auto_check_update", self.auto_update_chk.isChecked())
+        self.settings.setValue("silent_exit", self.silent_exit_chk.isChecked())
+
+    def on_autostart_change(self):
+        self.settings.setValue("auto_start", self.auto_start_chk.isChecked())
+        self.set_startup_registry(self.auto_start_chk.isChecked())
+
+    def set_startup_registry(self, enable):
+        try:
+            import winreg as reg
+            key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            with reg.OpenKey(reg.HKEY_CURRENT_USER, key_path, 0, reg.KEY_SET_VALUE) as key:
+                if enable:
+                    reg.SetValueEx(key, "BingWallpaperManager", 0, reg.REG_SZ, os.path.abspath(sys.argv[0]))
+                else:
+                    try: reg.DeleteValue(key, "BingWallpaperManager")
+                    except: pass
+        except: pass
 
     def on_exit(self):
-        """退出程序"""
         self.tray_icon.hide()
         QApplication.quit()
 
-    def check_for_updates(self):
-        """检查是否有新版本发布"""
-        if not self.auto_check_update_checkbox.isChecked() and self.sender() != self.check_update_btn:
-            return
-            
-        self.status_label.setText("正在检查更新...")
-        
-        api_url = "https://api.github.com/repos/QsSama-W/wallpaper-win/releases/latest"
-        
-        try:
-            response = requests.get(api_url, verify=True, timeout=10)
-            response.raise_for_status()
-            release_info = response.json()
-            
-            latest_version_tag = release_info.get('tag_name', '')
-            latest_version = re.sub(r'^v', '', latest_version_tag)
-            
-            if version.parse(latest_version) > version.parse(self.current_version):
-                self.show_update_message(latest_version, release_info.get('html_url'))
-            else:
-                self.status_label.setText("当前已是最新版本")
-                
-        except RequestException:
-            self.status_label.setText("更新检查失败: 网络错误")
-        except (KeyError, ValueError):
-            self.status_label.setText("更新检查失败: 解析错误")
-        except Exception as e:
-            self.status_label.setText(f"更新检查失败: {str(e)}")
-
-    def show_update_message(self, latest_version, release_url):
-        """显示更新提示对话框"""
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("发现新版本")
-        msg_box.setIcon(QMessageBox.Information)
-        msg_box.setText(f"发现新版本 {latest_version}！\n当前版本: {self.current_version}")
-        msg_box.setInformativeText("是否前往GitHub查看更新？")
-        
-        update_btn = msg_box.addButton("前往更新", QMessageBox.AcceptRole)
-        later_btn = msg_box.addButton("稍后再说", QMessageBox.RejectRole)
-        
-        msg_box.exec_()
-        
-        if msg_box.clickedButton() == update_btn:
-            webbrowser.open(release_url)
-        self.status_label.setText(f"发现新版本 {latest_version}")
-
-    def download_and_set_wallpaper(self):
-        """手动下载并设置壁纸，带弹窗提示"""
-        self.status_label.setText("正在获取壁纸信息...")
-        
-        wallpaper_url = self.get_bing_wallpaper_url()
-        if not wallpaper_url:
-            return
-            
-        today = datetime.date.today().strftime("%Y%m%d")
-        filename = f"{today}_UHD.jpg"
-        save_path = os.path.join(self.save_dir, filename)
-        
-        try:
-            if os.path.exists(save_path):
-                self.status_label.setText("壁纸已存在，直接设置为桌面背景...")
-            else:
-                self.status_label.setText("正在下载壁纸...")
-                response = requests.get(wallpaper_url, verify=False, stream=True)
-                response.raise_for_status()
-                
-                with open(save_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=1024):
-                        if chunk:
-                            f.write(chunk)
-                
-                self.status_label.setText("壁纸下载完成")
-            
-            if self.auto_delete_checkbox.isChecked():
-                self.delete_old_wallpapers()
-            
-            if self.set_wallpaper(save_path):
-                self.status_label.setText("壁纸设置成功！")
-                QMessageBox.information(self, "成功", "壁纸已成功设置为桌面背景")
-                self.refresh_preview()
-                # [新增] 手动设置成功后也触发自动退出，保持逻辑一致
-                self.schedule_auto_exit()
-            else:
-                self.status_label.setText("壁纸设置失败")
-                QMessageBox.warning(self, "失败", "无法设置桌面壁纸")
-                
-        except Exception as e:
-            error_msg = f"操作失败: {str(e)}"
-            self.status_label.setText(error_msg)
-            QMessageBox.critical(self, "错误", error_msg)
-
-    def set_wallpaper(self, image_path):
-        """设置桌面壁纸"""
-        try:
-            SPI_SETDESKWALLPAPER = 20
-            SPIF_UPDATEINIFILE = 1
-            ctypes.windll.user32.SystemParametersInfoW(
-                SPI_SETDESKWALLPAPER, 
-                0, 
-                image_path, 
-                SPIF_UPDATEINIFILE
-            )
-            return True
-        except Exception as e:
-            print(f"设置壁纸失败: {str(e)}")
-            return False
-
-
 if __name__ == "__main__":
+    if sys.platform.startswith('win'):
+        try:
+            myappid = '每日必应壁纸'
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except: pass
+
     QApplication.setApplicationName("Bing壁纸")
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
+    
     app = QApplication(sys.argv)
     
     if sys.platform.startswith('win'):
-        import win32event
-        import win32api
-        from winerror import ERROR_ALREADY_EXISTS
-        
-        mutex = win32event.CreateMutex(None, False, "BingWallpaperManagerMutex")
-        if win32api.GetLastError() == ERROR_ALREADY_EXISTS:
-            QMessageBox.information(None, "提示", "程序已在运行中！")
-            sys.exit(0)
+        try:
+            import win32event, win32api
+            from winerror import ERROR_ALREADY_EXISTS
+            mutex = win32event.CreateMutex(None, False, "BingWallpaperMutex_V1.4")
+            if win32api.GetLastError() == ERROR_ALREADY_EXISTS: sys.exit(0)
+        except: pass
     
-    window = BingWallpaperManager()
+    w = BingWallpaperApp()
     sys.exit(app.exec_())
