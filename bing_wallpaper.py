@@ -28,7 +28,7 @@ from PyQt5.QtCore import Qt, QTimer, QSettings, QSize, QPoint, QThread, pyqtSign
 from PyQt5.QtGui import QIcon, QPixmap, QImage, QColor, QFont, QPainter, QPainterPath
 
 # ==========================================
-# 0. 核心工具函数 - 修复图标路径问题
+# 0. 核心工具函数
 # ==========================================
 def resource_path(relative_path):
     if hasattr(sys, '_MEIPASS'):
@@ -176,12 +176,11 @@ class ModernCheckBox(QCheckBox):
 class BingWallpaperApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.current_version = "1.4.0" 
+        self.current_version = "1.5.0" 
         self.username = getpass.getuser()
         self.save_dir = os.path.join(f"C:\\Users\\{self.username}", "Pictures", "bing_wallpaper")
         
         self.images_dir = resource_path("images")
-        
         self.settings = QSettings("BingWallpaper", "Manager")
         
         self.preview_worker = None
@@ -190,9 +189,12 @@ class BingWallpaperApp(QMainWindow):
         self.is_download_running = False
         self.is_preview_running = False
         
+        # 新增：记录上一次拉取的整点小时，防重复拉取
+        self.last_update_hour = -1
+        
         self.shadow_margin = 25
         self.content_width = 680
-        self.content_height = 780 
+        self.content_height = 820 # 调高以容纳新复选框
         self.resize(self.content_width + 2*self.shadow_margin, self.content_height + 2*self.shadow_margin)
         
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowSystemMenuHint | Qt.WindowMinimizeButtonHint)
@@ -226,6 +228,11 @@ class BingWallpaperApp(QMainWindow):
         
         if self.auto_update_chk.isChecked():
             QTimer.singleShot(5000, self.start_check_update)
+            
+        # 新增：开启常驻后台的定时任务检测，每30秒检查一次时间
+        self.cron_timer = QTimer(self)
+        self.cron_timer.timeout.connect(self.check_cron_task)
+        self.cron_timer.start(30000)
 
     def setup_ui(self):
         base_widget = QWidget()
@@ -334,16 +341,19 @@ class BingWallpaperApp(QMainWindow):
         self.auto_start_chk = ModernCheckBox("开机自动启动")
         self.auto_update_chk = ModernCheckBox("自动检查软件更新")
         self.silent_exit_chk = ModernCheckBox("壁纸无更新时不弹出通知") 
+        self.bg_resident_chk = ModernCheckBox("后台常驻定时更新(勾选后不退出，每小时01分更新)") # 新增复选框
         
         self.auto_del_chk.stateChanged.connect(self.save_settings)
         self.auto_start_chk.stateChanged.connect(self.on_autostart_change)
         self.auto_update_chk.stateChanged.connect(self.save_settings)
         self.silent_exit_chk.stateChanged.connect(self.save_settings)
+        self.bg_resident_chk.stateChanged.connect(self.save_settings) # 绑定保存事件
         
         layout.addWidget(self.auto_del_chk)
         layout.addWidget(self.auto_start_chk)
         layout.addWidget(self.auto_update_chk)
         layout.addWidget(self.silent_exit_chk)
+        layout.addWidget(self.bg_resident_chk) # 添加到UI布局
         self.content_layout.addWidget(frame)
 
     def setup_footer(self):
@@ -392,6 +402,17 @@ class BingWallpaperApp(QMainWindow):
         else:
             self.status_label.setText("就绪")
 
+    # 新增：定时常驻任务检测
+    def check_cron_task(self):
+        if not self.bg_resident_chk.isChecked():
+            return
+        
+        now = datetime.datetime.now()
+        # 只要到了x点01分，并且该小时没拉取过，就拉取更新
+        if now.minute == 1 and now.hour != self.last_update_hour:
+            self.last_update_hour = now.hour
+            self.start_auto_download()
+
     def start_refresh_preview(self):
         if self.is_preview_running: return 
         self.is_preview_running = True
@@ -400,6 +421,7 @@ class BingWallpaperApp(QMainWindow):
         self.preview_worker = Worker(self.task_refresh_preview)
         self.preview_worker.signals.finished.connect(self.on_preview_ready)
         self.preview_worker.signals.error.connect(self.on_preview_error)
+        self.preview_worker.finished.connect(self.preview_worker.deleteLater) # 新增：线程结束后立即销毁释放内存
         self.preview_worker.start()
 
     def task_refresh_preview(self):
@@ -454,6 +476,7 @@ class BingWallpaperApp(QMainWindow):
         self.download_worker = Worker(self.task_download_set, auto_exit=False)
         self.download_worker.signals.finished.connect(self.on_download_success)
         self.download_worker.signals.error.connect(self.on_worker_error)
+        self.download_worker.finished.connect(self.download_worker.deleteLater) # 新增：销毁对象防止内存泄漏
         self.download_worker.start()
 
     def start_auto_download(self):
@@ -464,6 +487,7 @@ class BingWallpaperApp(QMainWindow):
         self.download_worker = Worker(self.task_download_set, auto_exit=True)
         self.download_worker.signals.finished.connect(self.on_download_success)
         self.download_worker.signals.error.connect(self.on_auto_error)
+        self.download_worker.finished.connect(self.download_worker.deleteLater) # 新增：销毁对象防止内存泄漏
         self.download_worker.start()
 
     def task_download_set(self, auto_exit=False):
@@ -505,6 +529,16 @@ class BingWallpaperApp(QMainWindow):
 
     def schedule_exit(self, is_new=True):
         self.is_download_running = False
+        
+        # 新增：判断如果常驻后台被勾选，不执行一分钟后的退出事件，并出对应通知
+        if self.bg_resident_chk.isChecked():
+            if is_new:
+                self.status_label.setText("壁纸已更新，继续后台常驻")
+                self.tray_icon.showMessage("每日必应壁纸", "Bing壁纸已更新", QSystemTrayIcon.Information, 2000)
+            else:
+                self.status_label.setText("壁纸已是最新的，继续后台常驻(静默)")
+            return 
+            
         if is_new:
             self.status_label.setText("任务完成，1分钟后自动退出")
             self.tray_icon.showMessage("每日必应壁纸", "Bing壁纸已更新，程序即将退出", QSystemTrayIcon.Information, 2000)
@@ -525,6 +559,7 @@ class BingWallpaperApp(QMainWindow):
         self.status_label.setText("检查更新...")
         self.update_worker = Worker(WallpaperUtils.check_update, self.current_version)
         self.update_worker.signals.finished.connect(self.on_update_checked)
+        self.update_worker.finished.connect(self.update_worker.deleteLater) # 新增：销毁对象防止内存泄漏
         self.update_worker.start()
 
     def on_update_checked(self, result):
@@ -599,21 +634,25 @@ class BingWallpaperApp(QMainWindow):
         self.auto_start_chk.blockSignals(True)
         self.auto_update_chk.blockSignals(True)
         self.silent_exit_chk.blockSignals(True)
+        self.bg_resident_chk.blockSignals(True) # 新增
 
         self.auto_del_chk.setChecked(self._get_bool_setting("auto_delete", False))
         self.auto_start_chk.setChecked(self._get_bool_setting("auto_start", False))
         self.auto_update_chk.setChecked(self._get_bool_setting("auto_check_update", True))
         self.silent_exit_chk.setChecked(self._get_bool_setting("silent_exit", False))
+        self.bg_resident_chk.setChecked(self._get_bool_setting("bg_resident", False)) # 新增
         
         self.auto_del_chk.blockSignals(False)
         self.auto_start_chk.blockSignals(False)
         self.auto_update_chk.blockSignals(False)
         self.silent_exit_chk.blockSignals(False)
+        self.bg_resident_chk.blockSignals(False) # 新增
 
     def save_settings(self):
         self.settings.setValue("auto_delete", self.auto_del_chk.isChecked())
         self.settings.setValue("auto_check_update", self.auto_update_chk.isChecked())
         self.settings.setValue("silent_exit", self.silent_exit_chk.isChecked())
+        self.settings.setValue("bg_resident", self.bg_resident_chk.isChecked()) # 新增
 
     def on_autostart_change(self):
         self.settings.setValue("auto_start", self.auto_start_chk.isChecked())
@@ -651,7 +690,7 @@ if __name__ == "__main__":
         try:
             import win32event, win32api
             from winerror import ERROR_ALREADY_EXISTS
-            mutex = win32event.CreateMutex(None, False, "BingWallpaperMutex_V1.4")
+            mutex = win32event.CreateMutex(None, False, "BingWallpaperMutex_V1.5")
             if win32api.GetLastError() == ERROR_ALREADY_EXISTS: sys.exit(0)
         except: pass
     

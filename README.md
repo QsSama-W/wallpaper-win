@@ -22,6 +22,6 @@
 
 **效果展示**
 
-<img src="https://github.com/QsSama-W/wallpaper-win/blob/main/v1.4.0.png" style="zoom:50%;" />
+<img src="https://github.com/QsSama-W/wallpaper-win/blob/main/v1.5.0.png" style="zoom:50%;" />
 
 <img src="https://github.com/QsSama-W/wallpaper-win/blob/main/img.png" style="zoom:50%;" />
